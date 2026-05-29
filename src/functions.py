@@ -98,7 +98,7 @@ TARGET_CONFIG = {
     "price": {
         "target": "FR_price_actual",
         "features": PRICE_FEATURES,
-        "model_type": "xgboost",
+        "model_type": "lightgbm",
     },
 }
 
