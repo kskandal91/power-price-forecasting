@@ -88,17 +88,17 @@ TARGET_CONFIG = {
     "solar": {
         "target": "FR_solar_actual",
         "features": SOLAR_FEATURES,
-        "model_type": "random_forest",
+        "model_type": "lightgbm1",
     },
     "wind": {
         "target": "FR_wind_actual",
         "features": WIND_FEATURES,
-        "model_type": "lightgbm",
+        "model_type": "lightgbm2",
     },
     "price": {
         "target": "FR_price_actual",
         "features": PRICE_FEATURES,
-        "model_type": "lightgbm",
+        "model_type": "xgboost",
     },
 }
 
@@ -279,9 +279,9 @@ def build_train_df(target_train, weather_train, network_train):
 
     df = target_train.copy()
 
-    df = clean_targets(df)
-
     df = add_calendar_features(df)
+
+    df = clean_targets(df)
 
     df = add_avg_weather_features(df, weather_train)
 
@@ -310,11 +310,35 @@ def build_test_df(weather_test, network_test):
 
 def make_model(model_type="random_forest"):
 
-    if model_type == "lightgbm":
+    if model_type == "lightgbm1":
         return LGBMRegressor(
             n_estimators=1000,
             learning_rate=0.03,
             num_leaves=31,
+            reg_alpha=0.7,
+            reg_lambda=0.7,
+            random_state=42,
+            n_jobs=-1,
+        )
+
+    if model_type == "lightgbm2":
+        return LGBMRegressor(
+            n_estimators=1000,
+            learning_rate=0.03,
+            num_leaves=31,
+            reg_alpha=0.1,
+            reg_lambda=0.2,
+            random_state=42,
+            n_jobs=-1,
+        )
+
+    if model_type == "lightgbm3":
+        return LGBMRegressor(
+            n_estimators=1000,
+            learning_rate=0.03,
+            num_leaves=31,
+            reg_alpha=0.1,
+            reg_lambda=0.1,
             random_state=42,
             n_jobs=-1,
         )
@@ -326,7 +350,7 @@ def make_model(model_type="random_forest"):
             max_depth=6,
             subsample=0.8,
             colsample_bytree=0.8,
-            reg_alpha=0.1,
+            reg_alpha=0.0,
             reg_lambda=0.1,
             random_state=42,
             n_jobs=-1,
@@ -334,7 +358,7 @@ def make_model(model_type="random_forest"):
 
     return RandomForestRegressor(
         n_estimators=300,
-        max_depth=20,
+        max_depth=30,
         min_samples_leaf=10,
         max_features="sqrt",
         random_state=42,
@@ -350,31 +374,26 @@ def train_single_model(
     return_train=False,
 ):
     cols = features + [target]
-    train = df.loc[df.index < "2024-01-01", cols].dropna().copy()
 
+    train = df.loc[df.index < "2024-01-01", cols].dropna().copy()
     valid = df.loc[df.index >= "2024-01-01", cols].dropna().copy()
+
+    if target == "FR_solar_actual":
+        train = train.loc[train["sun_avg"].gt(100)]
 
     model = make_model(model_type)
 
-    model.fit(
-        train[features],
-        train[target],
-    )
+    model.fit(train[features], train[target])
 
     valid["pred"] = model.predict(valid[features])
 
-    mae = mean_absolute_error(
-        valid[target],
-        valid["pred"],
-    )
+    if target == "FR_solar_actual":
+        conservative_night = get_conservative_night_mask(valid.index)
+        valid.loc[conservative_night, "pred"] = 0
+        valid["pred"] = valid["pred"].clip(lower=0)
 
-    rmse = (
-        mean_squared_error(
-            valid[target],
-            valid["pred"],
-        )
-        ** 0.5
-    )
+    mae = mean_absolute_error(valid[target], valid["pred"])
+    rmse = mean_squared_error(valid[target], valid["pred"]) ** 0.5
 
     metrics = {
         "target": target,
@@ -389,14 +408,35 @@ def train_single_model(
 
     if return_train:
         train["pred"] = model.predict(train[features])
+
+        if target == "FR_solar_actual":
+            train["pred"] = train["pred"].clip(lower=0)
+
         return model, metrics, valid, train
-    else:
-        return model, metrics, valid
+
+    return model, metrics, valid
 
 
 # =========================================================
 # Training pipeline
 # =========================================================
+
+
+def get_conservative_night_mask(index):
+
+    winter = (
+        ((index.month == 9) & (index.day >= 21))
+        | (index.month.isin([10, 11, 12, 1, 2]))
+        | ((index.month == 3) & (index.day <= 21))
+    )
+
+    night_mask = np.where(
+        winter,
+        (index.hour <= 5) | (index.hour >= 21),
+        (index.hour <= 4) | (index.hour >= 22),
+    )
+
+    return night_mask
 
 
 def train_models(df, mode="validation"):
@@ -447,13 +487,13 @@ def train_models(df, mode="validation"):
         df["FR_wind_input"] = df["FR_wind_actual"]
 
         for name, config in TARGET_CONFIG.items():
-            train = df[config["features"] + [config["target"]]].dropna()
+            train = df[config["features"] + [config["target"]]].dropna().copy()
+
+            if name == "solar":
+                train = train.loc[train["sun_avg"].gt(100)]
 
             model = make_model(config["model_type"])
-            model.fit(
-                train[config["features"]],
-                train[config["target"]],
-            )
+            model.fit(train[config["features"]], train[config["target"]])
 
             models[name] = model
 
@@ -468,6 +508,7 @@ def train_models(df, mode="validation"):
 
 
 def predict_2025(models, test_df):
+
     test_df = test_df.copy()
 
     predictions = pd.DataFrame(index=test_df.index)
@@ -478,9 +519,15 @@ def predict_2025(models, test_df):
         pred_col = f"FR_{name}_pred"
         input_col = f"FR_{name}_input"
 
-        predictions[pred_col] = models[name].predict(test_df[config["features"]])
+        pred = models[name].predict(test_df[config["features"]])
 
-        test_df[input_col] = predictions[pred_col]
+        if name == "solar":
+            conservative_night = get_conservative_night_mask(test_df.index)
+            pred[conservative_night] = 0
+            pred = np.clip(pred, 0, None)
+
+        predictions[pred_col] = pred
+        test_df[input_col] = pred
 
     predictions["FR_price_pred"] = models["price"].predict(
         test_df[TARGET_CONFIG["price"]["features"]]
